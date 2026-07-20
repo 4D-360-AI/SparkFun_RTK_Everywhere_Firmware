@@ -66,9 +66,9 @@ static BLECharacteristic *statusChar   = nullptr;
 static BLECharacteristic *gnssCtrlChar = nullptr;
 static BLECharacteristic *gnssDataChar = nullptr;
 
-// Raw GNSS byte capture (RTCM MSM7 + NMEA) streamed to SD for PPK post-processing.
+// Raw GNSS byte capture (RTCM MSM7 + NMEA) streamed to LittleFS for PPK post-processing.
 // Written by gnssReadTask; served to the phone via 4d360006 on demand.
-static SdFile        *gnssRawFile    = nullptr;
+static File           gnssRawFile;
 static char           gnssRawFileName[64] = {0};
 static volatile bool  gnssRawLogging = false;
 static volatile bool  gnssXferActive = false;
@@ -76,22 +76,20 @@ static volatile bool  gnssXferActive = false;
 // Called from gnssReadTask (Tasks.ino) — shields it from the static internals.
 void gnssRawWriteBytes(const uint8_t *buf, size_t len)
 {
-    if (gnssRawLogging && gnssRawFile != nullptr && len > 0)
-        gnssRawFile->write(buf, len);
+    if (gnssRawLogging && gnssRawFile && len > 0)
+        gnssRawFile.write(buf, len);
 }
 
 static void gnssOpenRawFile()
 {
-    if (gnssRawFile != nullptr) return;
-    gnssRawFile = new SdFile;
+    if (gnssRawFile) return;
     snprintf(gnssRawFileName, sizeof(gnssRawFileName),
              "/gnss_%02d%02d%02d_%02d%02d%02d.rtcm3",
              rtc.getYear() - 2000, rtc.getMonth() + 1, rtc.getDay(),
              rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
-    if (!gnssRawFile->open(gnssRawFileName, O_CREAT | O_TRUNC | O_WRITE))
+    gnssRawFile = LittleFS.open(gnssRawFileName, FILE_WRITE);
+    if (!gnssRawFile)
     {
-        delete gnssRawFile;
-        gnssRawFile = nullptr;
         gnssRawFileName[0] = 0;
         systemPrintln("gnssRawFile: open failed");
         return;
@@ -129,12 +127,9 @@ class GnssCtrlCallback : public BLECharacteristicCallbacks
         {
             // Stop captures, flush and close current file, then stream it.
             gnssRawLogging = false;
-            if (gnssRawFile != nullptr)
+            if (gnssRawFile)
             {
-                gnssRawFile->sync();
-                gnssRawFile->close();
-                delete gnssRawFile;
-                gnssRawFile = nullptr;
+                gnssRawFile.close();
             }
             if (gnssDataChar == nullptr) return;
             if (gnssRawFileName[0] == 0)
@@ -163,8 +158,8 @@ static void gnssXferTask(void *e)
 {
     gnssXferActive = true;
 
-    SdFile f;
-    if (!f.open(gnssRawFileName, O_READ))
+    File f = LittleFS.open(gnssRawFileName, FILE_READ);
+    if (!f)
     {
         uint8_t zero[4] = {0};
         gnssDataChar->setValue(zero, 4);
@@ -174,7 +169,7 @@ static void gnssXferTask(void *e)
         return;
     }
 
-    uint32_t fileSize = (uint32_t)f.fileSize();
+    uint32_t fileSize = (uint32_t)f.size();
     const uint16_t CHUNK = 182;
     uint8_t buf[182 + 4];
 
@@ -203,8 +198,10 @@ static void gnssXferTask(void *e)
     f.close();
     gnssXferActive = false;
 
-    // Immediately start a fresh obs file for the next capture.
-    if (online.microSD && online.rtc)
+    // Free the space and immediately start a fresh obs file for the next capture.
+    LittleFS.remove(gnssRawFileName);
+    gnssRawFileName[0] = 0;
+    if (online.fs && online.rtc)
         gnssOpenRawFile();
 
     vTaskDelete(nullptr);
@@ -272,8 +269,8 @@ void memsBleUpdate()
     if (!memsBleInited || memsChar == nullptr)
         return;
 
-    // ── Raw obs log — open once SD and RTC are both ready ───────────────────
-    if (gnssRawFile == nullptr && online.microSD && online.rtc)
+    // ── Raw obs log — open once LittleFS and RTC are both ready ─────────────
+    if (!gnssRawFile && online.fs && online.rtc)
         gnssOpenRawFile();
 
     // ── IMU frames ──────────────────────────────────────────────────────────
