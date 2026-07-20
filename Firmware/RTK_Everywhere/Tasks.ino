@@ -468,9 +468,11 @@ void gnssReadTask(void *e)
                         systemPrintf("gnssReadTask: bytesIncoming = %d\r\n", bytesIncoming);
                 }
 
+#ifdef COMPILE_BT
                 // Tee raw GNSS bytes to the PPK obs capture file before parsing.
                 if (gnssRawLogging && gnssRawFile != nullptr && bytesIncoming > 0)
                     gnssRawFile->write(incomingData, (size_t)bytesIncoming);
+#endif // COMPILE_BT
 
                 for (int x = 0; x < bytesIncoming; x++)
                 {
