@@ -35,6 +35,311 @@ Tilt.ino
 
 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
+// ---- MEMS BLE streaming + RTK correction injection + fix status ---------
+// 32-byte frame: timestamp (double) + accel XYZ (float×3) + gyro XYZ (float×3)
+#pragma pack(push, 1)
+struct MemsFrame { double t; float ax, ay, az, gx, gy, gz; };
+#pragma pack(pop)
+
+#define MEMS_RING_SIZE 128  // power of 2; 1.28s at 100 Hz
+
+static MemsFrame   memsRing[MEMS_RING_SIZE];
+static volatile uint8_t memsHead = 0, memsTail = 0;
+
+static bool memsBleInited = false;
+
+#ifdef COMPILE_BT
+#include "BleSerialServer.h"
+#include <BLE2902.h>
+
+// UUIDs — all on the same 4d360001 service so the phone connects once.
+#define MEMS_SERVICE_UUID "4d360001-0000-1000-8000-004d36000000"
+#define MEMS_CHAR_UUID    "4d360002-0000-1000-8000-004d36000000"
+#define RTCM_WRITE_UUID   "4d360003-0000-1000-8000-004d36000000"  // phone → Torch RTCM3
+#define STATUS_CHAR_UUID  "4d360004-0000-1000-8000-004d36000000"  // Torch → phone fix status
+#define GNSS_CTRL_UUID    "4d360005-0000-1000-8000-004d36000000"  // phone → Torch: 0x01=send file, 0x00=abort
+#define GNSS_DATA_UUID    "4d360006-0000-1000-8000-004d36000000"  // Torch → phone: raw obs stream
+
+static BLECharacteristic *memsChar     = nullptr;
+static BLECharacteristic *rtcmChar     = nullptr;
+static BLECharacteristic *statusChar   = nullptr;
+static BLECharacteristic *gnssCtrlChar = nullptr;
+static BLECharacteristic *gnssDataChar = nullptr;
+
+// Raw GNSS byte capture (RTCM MSM7 + NMEA) streamed to SD for PPK post-processing.
+// Written by gnssReadTask; served to the phone via 4d360006 on demand.
+static SdFile        *gnssRawFile    = nullptr;
+static char           gnssRawFileName[64] = {0};
+static volatile bool  gnssRawLogging = false;
+static volatile bool  gnssXferActive = false;
+
+static void gnssOpenRawFile()
+{
+    if (gnssRawFile != nullptr) return;
+    gnssRawFile = new SdFile;
+    snprintf(gnssRawFileName, sizeof(gnssRawFileName),
+             "/gnss_%02d%02d%02d_%02d%02d%02d.rtcm3",
+             rtc.getYear() - 2000, rtc.getMonth() + 1, rtc.getDay(),
+             rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
+    if (!gnssRawFile->open(gnssRawFileName, O_CREAT | O_TRUNC | O_WRITE))
+    {
+        delete gnssRawFile;
+        gnssRawFile = nullptr;
+        gnssRawFileName[0] = 0;
+        systemPrintln("gnssRawFile: open failed");
+        return;
+    }
+    gnssRawLogging = true;
+    systemPrintf("gnssRawFile: logging to %s\r\n", gnssRawFileName);
+}
+
+// Forward declaration — defined after GnssCtrlCallback.
+static void gnssXferTask(void *);
+
+// Write callback: forward RTCM3 bytes received over BLE to the GNSS receiver.
+// The UM980 accepts a continuous RTCM3 byte stream on its UART — no framing needed here.
+class RtcmWriteCallback : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *c) override
+    {
+        String val = c->getValue();
+        if (val.length() > 0 && gnss != nullptr)
+            gnss->pushRawData((uint8_t *)val.c_str(), (int)val.length());
+    }
+};
+static RtcmWriteCallback rtcmWriteCb;
+
+// Write callback: 0x01 = transfer last raw obs file; 0x00 = abort transfer.
+class GnssCtrlCallback : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *c) override
+    {
+        String val = c->getValue();
+        if (val.length() == 0) return;
+        uint8_t cmd = (uint8_t)val[0];
+
+        if (cmd == 0x01) // send file
+        {
+            // Stop captures, flush and close current file, then stream it.
+            gnssRawLogging = false;
+            if (gnssRawFile != nullptr)
+            {
+                gnssRawFile->sync();
+                gnssRawFile->close();
+                delete gnssRawFile;
+                gnssRawFile = nullptr;
+            }
+            if (gnssDataChar == nullptr) return;
+            if (gnssRawFileName[0] == 0)
+            {
+                // No file yet — send 4-byte zero header so the phone knows.
+                uint8_t zero[4] = {0};
+                gnssDataChar->setValue(zero, 4);
+                gnssDataChar->notify();
+                return;
+            }
+            if (!gnssXferActive)
+                xTaskCreate(gnssXferTask, "gnssXfer", 8192, nullptr, 1, nullptr);
+        }
+        else if (cmd == 0x00) // abort
+        {
+            gnssXferActive = false;
+        }
+    }
+};
+static GnssCtrlCallback gnssCtrlCb;
+
+// FreeRTOS task: streams the most recent raw obs file over BLE notify in 182-byte chunks.
+// Protocol: first notification = [fileSize: u32 LE][data...]; subsequent = [data...].
+// After transfer, opens a fresh log file for the next capture session.
+static void gnssXferTask(void *e)
+{
+    gnssXferActive = true;
+
+    SdFile f;
+    if (!f.open(gnssRawFileName, O_READ))
+    {
+        uint8_t zero[4] = {0};
+        gnssDataChar->setValue(zero, 4);
+        gnssDataChar->notify();
+        gnssXferActive = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    uint32_t fileSize = (uint32_t)f.fileSize();
+    const uint16_t CHUNK = 182;
+    uint8_t buf[182 + 4];
+
+    // First packet includes the 4-byte file-size header.
+    buf[0] = (uint8_t)(fileSize & 0xFF);
+    buf[1] = (uint8_t)((fileSize >>  8) & 0xFF);
+    buf[2] = (uint8_t)((fileSize >> 16) & 0xFF);
+    buf[3] = (uint8_t)((fileSize >> 24) & 0xFF);
+    int n = f.read(buf + 4, CHUNK);
+    if (n > 0)
+    {
+        gnssDataChar->setValue(buf, (size_t)(4 + n));
+        gnssDataChar->notify();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    while (gnssXferActive)
+    {
+        n = f.read(buf, CHUNK);
+        if (n <= 0) break;
+        gnssDataChar->setValue(buf, (size_t)n);
+        gnssDataChar->notify();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    f.close();
+    gnssXferActive = false;
+
+    // Immediately start a fresh obs file for the next capture.
+    if (online.microSD && online.rtc)
+        gnssOpenRawFile();
+
+    vTaskDelete(nullptr);
+}
+
+void memsBleInit()
+{
+    if (memsBleInited) return; // Already done — safe to call multiple times
+
+    BLEServer *srv = BleSerialServer::getInstance().Server;
+    if (srv == nullptr)
+    {
+        systemPrintln("MEMS BLE: server not ready yet");
+        return;
+    }
+
+    // Handle space: 1 service + 3+2+3+2+3 chars/descriptors = 14 → use 24 for headroom.
+    BLEService *svc = srv->createService(BLEUUID(MEMS_SERVICE_UUID), 24);
+
+    // 4d360002 — IMU frame notify (existing)
+    memsChar = svc->createCharacteristic(BLEUUID(MEMS_CHAR_UUID),
+                                          BLECharacteristic::PROPERTY_NOTIFY);
+    memsChar->addDescriptor(new BLE2902());
+
+    // 4d360003 — RTCM3 write (phone relays corrections from NTRIP caster)
+    rtcmChar = svc->createCharacteristic(BLEUUID(RTCM_WRITE_UUID),
+                                          BLECharacteristic::PROPERTY_WRITE |
+                                          BLECharacteristic::PROPERTY_WRITE_NR);
+    rtcmChar->setCallbacks(&rtcmWriteCb);
+
+    // 4d360004 — fix status notify (16 bytes, little-endian):
+    //   [0]     fixCat  (0=none 1=single 2=RTK-float 3=RTK-fixed)
+    //   [1]     sats
+    //   [2-3]   hAccMm  (uint16)
+    //   [4-7]   lat     (int32, degrees × 1e7)
+    //   [8-11]  lon     (int32, degrees × 1e7)
+    //   [12-15] t_utc   (float32, UTC seconds-of-day; 0.0 = not yet valid)
+    statusChar = svc->createCharacteristic(BLEUUID(STATUS_CHAR_UUID),
+                                            BLECharacteristic::PROPERTY_NOTIFY);
+    statusChar->addDescriptor(new BLE2902());
+
+    // 4d360005 — raw obs transfer control (write, phone → Torch)
+    gnssCtrlChar = svc->createCharacteristic(BLEUUID(GNSS_CTRL_UUID),
+                                              BLECharacteristic::PROPERTY_WRITE |
+                                              BLECharacteristic::PROPERTY_WRITE_NR);
+    gnssCtrlChar->setCallbacks(&gnssCtrlCb);
+
+    // 4d360006 — raw obs data stream (notify, Torch → phone)
+    gnssDataChar = svc->createCharacteristic(BLEUUID(GNSS_DATA_UUID),
+                                              BLECharacteristic::PROPERTY_NOTIFY);
+    gnssDataChar->addDescriptor(new BLE2902());
+
+    svc->start();
+
+    BLEAdvertising *adv = srv->getAdvertising();
+    adv->addServiceUUID(BLEUUID(MEMS_SERVICE_UUID));
+    adv->start();
+
+    memsBleInited = true;
+    systemPrintln("MEMS BLE ready: IMU(4d360002) RTCM(4d360003) Status(4d360004) GNSS(4d360005/06)");
+}
+
+void memsBleUpdate()
+{
+    if (!memsBleInited || memsChar == nullptr)
+        return;
+
+    // ── Raw obs log — open once SD and RTC are both ready ───────────────────
+    if (gnssRawFile == nullptr && online.microSD && online.rtc)
+        gnssOpenRawFile();
+
+    // ── IMU frames ──────────────────────────────────────────────────────────
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend >= 100)
+    {
+        lastSend = millis();
+
+        uint8_t buf[320];
+        uint8_t count = 0;
+        while (count < 10 && memsTail != memsHead)
+        {
+            memcpy(buf + (uint16_t)(count * 32), &memsRing[memsTail], 32);
+            memsTail = (memsTail + 1) & (MEMS_RING_SIZE - 1);
+            count++;
+        }
+        if (count > 0)
+        {
+            memsChar->setValue(buf, (uint16_t)(count * 32));
+            memsChar->notify();
+        }
+    }
+
+    // ── Fix status (1 Hz) ───────────────────────────────────────────────────
+    if (statusChar == nullptr || gnss == nullptr) return;
+
+    static unsigned long lastStatus = 0;
+    if (millis() - lastStatus < 1000) return;
+    lastStatus = millis();
+
+    uint8_t fixCat = 0;
+    if      (gnss->isRTKFix())                    fixCat = 3;
+    else if (gnss->isRTKFloat())                   fixCat = 2;
+    else if (gnss->getFixType() >= 16)             fixCat = 1; // single or better
+
+    uint8_t  sats    = gnss->getSatellitesInView();
+    float    hAccM   = gnss->getHorizontalAccuracy();
+    uint16_t hAccMm  = (uint16_t)min(65535.0f, hAccM * 1000.0f);
+
+    // lat/lon as int32, degrees × 1e7 (≈1 cm resolution), little-endian
+    int32_t latI = (int32_t)(gnss->getLatitude()  * 1e7);
+    int32_t lonI = (int32_t)(gnss->getLongitude() * 1e7);
+
+    // UTC seconds-of-day (float32). 0.0 signals "not yet valid".
+    float tUtc = 0.0f;
+    if (gnss->isConfirmedTime())
+        tUtc = gnss->getHour() * 3600.0f + gnss->getMinute() * 60.0f
+               + gnss->getSecond() + gnss->getNanosecond() * 1e-9f;
+
+    uint8_t status[16];
+    status[0] = fixCat;
+    status[1] = sats;
+    status[2] = (uint8_t)(hAccMm & 0xFF);
+    status[3] = (uint8_t)(hAccMm >> 8);
+    status[4]  = (uint8_t)(latI         & 0xFF);
+    status[5]  = (uint8_t)((latI >>  8) & 0xFF);
+    status[6]  = (uint8_t)((latI >> 16) & 0xFF);
+    status[7]  = (uint8_t)((latI >> 24) & 0xFF);
+    status[8]  = (uint8_t)(lonI         & 0xFF);
+    status[9]  = (uint8_t)((lonI >>  8) & 0xFF);
+    status[10] = (uint8_t)((lonI >> 16) & 0xFF);
+    status[11] = (uint8_t)((lonI >> 24) & 0xFF);
+    memcpy(&status[12], &tUtc, 4); // float32 LE
+    statusChar->setValue(status, 16);
+    statusChar->notify();
+}
+
+#else
+void memsBleInit()   {}
+void memsBleUpdate() {}
+#endif  // COMPILE_BT
+// -----------------------------------------------------------------------
+
 #ifdef COMPILE_IM19_IMU
 
 typedef enum
@@ -91,12 +396,15 @@ void tiltUpdate()
     break;
 
     case TILT_STARTED:
+        // Always drain UART and process MEMS — 100 Hz stream runs regardless of fix state.
+        tiltSensor->update();
+        tiltProcessMEMS();
+        if (!memsBleInited) memsBleInit();
+        memsBleUpdate();
+
         // RTK Fix required for isInitialized so don't check tilt until we have RTK Fix.
         if (gnss->isRTKFix() == false)
             break;
-
-        // Waiting for user to rock unit back and forth
-        tiltSensor->update(); // Check for the most recent incoming binary data
 
         // Check IMU state at 1Hz
         if (millis() - lastTiltCheck > 1000)
@@ -134,6 +442,8 @@ void tiltUpdate()
     case TILT_INITIALIZED:
         // Waiting for user to rock unit back and forth
         tiltSensor->update(); // Check for the most recent incoming binary data
+        tiltProcessMEMS();
+        memsBleUpdate();
 
         // Check IMU state at 1Hz
         if ((millis() - lastTiltCheck) > 1000)
@@ -161,6 +471,8 @@ void tiltUpdate()
     case TILT_CORRECTING:
         // Check to see if we've stopped correcting
         tiltSensor->update(); // Check for the most recent incoming binary data
+        tiltProcessMEMS();
+        memsBleUpdate();
 
         // Check IMU state at 1Hz
         if ((millis() - lastTiltCheck) > 1000)
@@ -291,6 +603,33 @@ void printTiltDebug()
     }
 }
 
+// Called every main loop iteration — captures each new MEMS frame into the ring buffer
+// and logs at 1 Hz so we can confirm data is flowing.
+void tiltProcessMEMS()
+{
+    if (tiltSensor == nullptr || tiltSensor->packetMems == nullptr)
+        return;
+    if (tiltSensor->getMemsAge() > 20) // no frame in last 20 ms
+        return;
+
+    // Detect new frames by timestamp change
+    static double lastSeen = -1.0;
+    double t = tiltSensor->getMemsTimestamp();
+    if (t == lastSeen)
+        return;
+    lastSeen = t;
+
+    MemsFrame f = { t,
+        tiltSensor->getMemsAccelX(), tiltSensor->getMemsAccelY(), tiltSensor->getMemsAccelZ(),
+        tiltSensor->getMemsGyroX(),  tiltSensor->getMemsGyroY(),  tiltSensor->getMemsGyroZ() };
+    // Push to ring buffer (inline to avoid Arduino prototype-injector issue with MemsFrame in sig)
+    {
+        uint8_t next = (memsHead + 1) & (MEMS_RING_SIZE - 1);
+        if (next != memsTail) { memsRing[memsHead] = f; memsHead = next; }
+    }
+
+}
+
 // Start communication with the IM19 IMU
 void beginTilt()
 {
@@ -300,10 +639,18 @@ void beginTilt()
     if (SerialForTilt == nullptr)
         SerialForTilt = new HardwareSerial(2);
 
-    SerialForTilt->setRxBufferSize(1024 * 1);
+    SerialForTilt->setRxBufferSize(1024 * 4); // Extra room to absorb any MEMS stream
 
     // We must start the serial port before handing it over to the library
     SerialForTilt->begin(115200, SERIAL_8N1, pin_IMU_RX, pin_IMU_TX);
+
+    // MEMS_OUTPUT=UART1,ON is saved to IM19 NVM and survives ESP32 reboot.
+    // On second+ boot the IM19 blasts 100 Hz frames immediately, corrupting
+    // the AT handshake in begin(). Send MEMS_OUTPUT=UART1,OFF first, then
+    // drain the RX buffer before handing the port to the library.
+    SerialForTilt->print("AT+MEMS_OUTPUT=UART1,OFF\r\n");
+    delay(300);
+    while (SerialForTilt->available()) SerialForTilt->read();
 
     if (settings.enableImuDebug == true)
         tiltSensor->enableDebugging(); // Print all debug to Serial
@@ -354,10 +701,6 @@ void beginTilt()
     // AT+HIGH_RATE=[ENABLE | DISABLE] - try to slow down NAVI
     result &= tiltSensor->sendCommand("HIGH_RATE=DISABLE");
 
-    // Turn off MEMS output.
-    // result &= tiltSensor->sendCommand("MEMS_OUTPUT=UART1,ON"); //Stock firmware enables MEMS
-    result &= tiltSensor->sendCommand("MEMS_OUTPUT=UART1,OFF");
-
     // Unknown new command for v2
     result &= tiltSensor->sendCommand("CORRECT_HOLDER=ENABLE"); // From stock firmware
 
@@ -374,6 +717,10 @@ void beginTilt()
     {
         if (tiltSensor->saveConfiguration() == true)
         {
+            // Enable raw MEMS output (100 Hz accel/gyro for IMU<->IMU time-sync with X5).
+            // Done after saveConfiguration() so 100 Hz frames don't corrupt ACKs for other commands.
+            bool memsOK = tiltSensor->sendCommand("MEMS_OUTPUT=UART1,ON");
+            systemPrintf("MEMS_OUTPUT=UART1,ON: %s\r\n", memsOK ? "OK" : "FAILED");
             systemPrintln("Tilt sensor configuration complete");
             tiltState = TILT_STARTED;
             return; // Success
