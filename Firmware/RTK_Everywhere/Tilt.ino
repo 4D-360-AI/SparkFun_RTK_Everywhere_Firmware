@@ -73,6 +73,13 @@ static char           gnssRawFileName[64] = {0};
 static volatile bool  gnssRawLogging = false;
 static volatile bool  gnssXferActive = false;
 
+// Called from gnssReadTask (Tasks.ino) — shields it from the static internals.
+void gnssRawWriteBytes(const uint8_t *buf, size_t len)
+{
+    if (gnssRawLogging && gnssRawFile != nullptr && len > 0)
+        gnssRawFile->write(buf, len);
+}
+
 static void gnssOpenRawFile()
 {
     if (gnssRawFile != nullptr) return;

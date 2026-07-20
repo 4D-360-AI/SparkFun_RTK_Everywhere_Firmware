@@ -469,9 +469,8 @@ void gnssReadTask(void *e)
                 }
 
 #ifdef COMPILE_BT
-                // Tee raw GNSS bytes to the PPK obs capture file before parsing.
-                if (gnssRawLogging && gnssRawFile != nullptr && bytesIncoming > 0)
-                    gnssRawFile->write(incomingData, (size_t)bytesIncoming);
+                // Tee raw GNSS bytes to the PPK obs capture file (defined in Tilt.ino).
+                gnssRawWriteBytes(incomingData, (size_t)bytesIncoming);
 #endif // COMPILE_BT
 
                 for (int x = 0; x < bytesIncoming; x++)
