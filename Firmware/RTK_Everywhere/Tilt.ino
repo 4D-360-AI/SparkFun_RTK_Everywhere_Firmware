@@ -758,13 +758,22 @@ static bool cfInited = false;
 
 static void tiltComplementaryFilterUpdate(float ax, float ay, float az, float gx, float gy, float dt)
 {
-    // Bench-verified 2026-08-05: this unit's IMU reports az≈-1g (not +1g) when
-    // resting level in its normal mounted orientation — Z is the up/down axis,
-    // but inverted from the textbook convention. Negate az here so "level" comes
-    // out as roll≈0°/pitch≈0° instead of wrapping to ≈180°.
-    float accMag = sqrtf(ax * ax + ay * ay + az * az);
-    float accelRoll  = atan2f(ay, -az);
-    float accelPitch = atan2f(ax, sqrtf(ay * ay + az * az));
+    // The Torch is mounted at 45° yaw in the vehicle: one corner faces forward,
+    // one back, one left, one right. Rotate IMU body-frame accel and gyro into
+    // vehicle frame (FLU: x=forward, y=left, z=up) before computing roll/pitch.
+    // Bench-verified 2026-08-05: nose-down gives ax>0,ay>0 → vehicle forward
+    // aligns with IMU (x+y)/√2, so the rotation angle is +45°.
+    // az is the vertical axis and is unaffected by a yaw rotation.
+    // az≈-1g when level (IMU Z inverted from textbook); -az is used below.
+    const float c45 = 0.70711f; // cos(45°) = sin(45°) = 1/√2
+    float ax_v = (ax + ay) * c45;  // vehicle forward
+    float ay_v = (-ax + ay) * c45; // vehicle left
+    float gx_v = (gx + gy) * c45; // roll rate  (around vehicle forward axis)
+    float gy_v = (-gx + gy) * c45;// pitch rate (around vehicle lateral axis)
+
+    float accMag = sqrtf(ax_v * ax_v + ay_v * ay_v + az * az);
+    float accelRoll  = atan2f(ay_v, -az);
+    float accelPitch = atan2f(ax_v, sqrtf(ay_v * ay_v + az * az));
 
     if (!cfInited)
     {
@@ -776,8 +785,8 @@ static void tiltComplementaryFilterUpdate(float ax, float ay, float az, float gx
 
     // Gyro integration every sample (rad/s * s = rad) — carries us through
     // the periods where the accel correction below is gated out.
-    cfRollRad  += gx * dt;
-    cfPitchRad += gy * dt;
+    cfRollRad  += gx_v * dt;
+    cfPitchRad += gy_v * dt;
 
     // Only trust the accelerometer as "down" when it's close to 1 g — otherwise
     // the vehicle is accelerating/braking/turning and the reading isn't gravity.
