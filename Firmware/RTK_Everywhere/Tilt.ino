@@ -48,6 +48,13 @@ static volatile uint8_t memsHead = 0, memsTail = 0;
 
 static bool memsBleInited = false;
 
+// Complementary-filter roll/pitch (radians), fed by tiltComplementaryFilterUpdate()
+// in the COMPILE_IM19_IMU block below. Declared here (file scope, unconditional) so
+// memsBleUpdate() — compiled under COMPILE_BT, and appearing earlier in this file —
+// can read them regardless of ifdef ordering. Default 0 matches the existing
+// "IM19 not running yet" fallback used elsewhere in this file.
+static float cfRollRad = 0.0f, cfPitchRad = 0.0f;
+
 #ifdef COMPILE_BT
 #include "BleSerialServer.h"
 #include <BLE2902.h>
@@ -58,13 +65,15 @@ static bool memsBleInited = false;
 #define RTCM_WRITE_UUID   "4d360003-0000-1000-8000-004d36000000"  // phone → Torch RTCM3
 #define STATUS_CHAR_UUID  "4d360004-0000-1000-8000-004d36000000"  // Torch → phone fix status
 #define GNSS_CTRL_UUID    "4d360005-0000-1000-8000-004d36000000"  // phone → Torch: 0x01=send file, 0x00=abort
-#define GNSS_DATA_UUID    "4d360006-0000-1000-8000-004d36000000"  // Torch → phone: raw obs stream
+#define GNSS_DATA_UUID    "4d360006-0000-1000-8000-004d36000000"  // Torch → phone: raw obs stream (post-capture)
+#define GNSS_STREAM_UUID  "4d360007-0000-1000-8000-004d36000000"  // Torch → phone: live RTCM3 obs (during capture)
 
-static BLECharacteristic *memsChar     = nullptr;
-static BLECharacteristic *rtcmChar     = nullptr;
-static BLECharacteristic *statusChar   = nullptr;
-static BLECharacteristic *gnssCtrlChar = nullptr;
-static BLECharacteristic *gnssDataChar = nullptr;
+static BLECharacteristic *memsChar       = nullptr;
+static BLECharacteristic *rtcmChar       = nullptr;
+static BLECharacteristic *statusChar     = nullptr;
+static BLECharacteristic *gnssCtrlChar   = nullptr;
+static BLECharacteristic *gnssDataChar   = nullptr;
+static BLECharacteristic *gnssStreamChar = nullptr;
 
 // Raw GNSS byte capture (RTCM MSM7 + NMEA) streamed to LittleFS for PPK post-processing.
 // Written by gnssReadTask; served to the phone via 4d360006 on demand.
@@ -72,21 +81,62 @@ static File           gnssRawFile;
 static char           gnssRawFileName[64] = {0};
 static volatile bool  gnssRawLogging = false;
 static volatile bool  gnssXferActive = false;
+static SemaphoreHandle_t gnssAckSem = nullptr; // released by [0x02] write from phone
 
 // Called from gnssReadTask (Tasks.ino) — shields it from the static internals.
 void gnssRawWriteBytes(const uint8_t *buf, size_t len)
 {
-    if (gnssRawLogging && gnssRawFile && len > 0)
+    if (len == 0) return;
+    if (gnssRawLogging && gnssRawFile)
         gnssRawFile.write(buf, len);
+    // Live-stream to the phone during capture. Fire-and-forget notify is fine here:
+    // RTCM3 arrives at ~1 Hz so the BLE queue never overflows. Muted during file
+    // transfer to avoid mixing the post-capture download stream with live obs bytes.
+    if (gnssStreamChar && !gnssXferActive)
+    {
+        gnssStreamChar->setValue((uint8_t *)buf, len);
+        gnssStreamChar->notify();
+    }
+}
+
+// Enable RTCM3 MSM7 rover output on the UM980 so the logged stream contains
+// carrier-phase observations (needed for PPK post-processing).
+// Messages: 1019 GPS ephemeris, 1077 GPS MSM7, 1087 GLO MSM7, 1097 GAL MSM7.
+// gnssConfigure() only sets a bit in settings.gnssConfigureRequest — thread-safe.
+// The main GNSS task polls that flag and does the actual UART work.
+static void gnssEnableRtcmMsm7()
+{
+#ifdef COMPILE_UM980
+    if (!present.gnss_um980) return;
+    for (int x = 0; x < MAX_UM980_RTCM_MSG; x++)
+    {
+        const char *n = umMessagesRTCM[x].msgTextName;
+        if (strcmp(n, "RTCM1019") == 0 || strcmp(n, "RTCM1077") == 0 ||
+            strcmp(n, "RTCM1087") == 0 || strcmp(n, "RTCM1097") == 0)
+            settings.um980MessageRatesRTCMRover[x] = 1;
+    }
+    gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_RTCM_ROVER);
+    systemPrintln("gnssRawFile: RTCM MSM7 rover output requested");
+#endif
+}
+
+static void gnssDisableRtcmMsm7()
+{
+#ifdef COMPILE_UM980
+    if (!present.gnss_um980) return;
+    for (int x = 0; x < MAX_UM980_RTCM_MSG; x++)
+        settings.um980MessageRatesRTCMRover[x] = 0;
+    gnssConfigure(GNSS_CONFIG_MESSAGE_RATE_RTCM_ROVER);
+    systemPrintln("gnssRawFile: RTCM MSM7 rover output disable requested");
+#endif
 }
 
 static void gnssOpenRawFile()
 {
     if (gnssRawFile) return;
-    snprintf(gnssRawFileName, sizeof(gnssRawFileName),
-             "/gnss_%02d%02d%02d_%02d%02d%02d.rtcm3",
-             rtc.getYear() - 2000, rtc.getMonth() + 1, rtc.getDay(),
-             rtc.getHour(true), rtc.getMinute(), rtc.getSecond());
+    // Fixed name so FILE_WRITE always truncates the previous session's data.
+    // RTC time is not needed: every RTCM3 message carries its own GPS time.
+    strlcpy(gnssRawFileName, "/gnss_obs.rtcm3", sizeof(gnssRawFileName));
     gnssRawFile = LittleFS.open(gnssRawFileName, FILE_WRITE);
     if (!gnssRawFile)
     {
@@ -95,7 +145,8 @@ static void gnssOpenRawFile()
         return;
     }
     gnssRawLogging = true;
-    systemPrintf("gnssRawFile: logging to %s\r\n", gnssRawFileName);
+    systemPrintln("gnssRawFile: logging to /gnss_obs.rtcm3");
+    gnssEnableRtcmMsm7();
 }
 
 // Forward declaration — defined after GnssCtrlCallback.
@@ -127,53 +178,79 @@ class GnssCtrlCallback : public BLECharacteristicCallbacks
         {
             // Stop captures, flush and close current file, then stream it.
             gnssRawLogging = false;
+            systemPrintf("gnssXfer: requested. fileName='%s' fileOpen=%d\r\n",
+                         gnssRawFileName, gnssRawFile ? 1 : 0);
             if (gnssRawFile)
             {
+                gnssRawFile.flush();
                 gnssRawFile.close();
             }
             if (gnssDataChar == nullptr) return;
             if (gnssRawFileName[0] == 0)
             {
-                // No file yet — send 4-byte zero header so the phone knows.
+                systemPrintln("gnssXfer: no file — sending zero header");
                 uint8_t zero[4] = {0};
                 gnssDataChar->setValue(zero, 4);
                 gnssDataChar->notify();
                 return;
             }
             if (!gnssXferActive)
+            {
+                // Set flag here, before xTaskCreate, to close the race with
+                // memsBleUpdate() which would otherwise reopen (and truncate)
+                // the file before the task gets a chance to read it.
+                gnssXferActive = true;
                 xTaskCreate(gnssXferTask, "gnssXfer", 8192, nullptr, 1, nullptr);
+            }
+        }
+        else if (cmd == 0x02) // ACK: phone ready for next chunk
+        {
+            if (gnssAckSem) xSemaphoreGive(gnssAckSem);
         }
         else if (cmd == 0x00) // abort
         {
             gnssXferActive = false;
+            if (gnssAckSem) xSemaphoreGive(gnssAckSem); // unblock task so it can exit
         }
     }
 };
 static GnssCtrlCallback gnssCtrlCb;
 
-// FreeRTOS task: streams the most recent raw obs file over BLE notify in 182-byte chunks.
-// Protocol: first notification = [fileSize: u32 LE][data...]; subsequent = [data...].
-// After transfer, opens a fresh log file for the next capture session.
+// FreeRTOS task: streams the most recent raw obs file over BLE in 500-byte chunks.
+// Protocol (stop-and-wait):
+//   Torch → phone: first notification = [fileSize: u32 LE][data...]; subsequent = [data...]
+//   Phone → Torch: [0x02] write on ctrl char after each chunk received (ACK / next-chunk request)
+// This prevents BLE notify queue overflow that caused silent packet drops at ~145 KB.
 static void gnssXferTask(void *e)
 {
     gnssXferActive = true;
+    gnssAckSem = xSemaphoreCreateBinary();
+    gnssDisableRtcmMsm7(); // Stop UM980 raw obs output before reading the file
 
     File f = LittleFS.open(gnssRawFileName, FILE_READ);
+    systemPrintf("gnssXfer: open '%s' ok=%d\r\n", gnssRawFileName, f ? 1 : 0);
     if (!f)
     {
+        systemPrintln("gnssXfer: file open failed — sending zero header");
         uint8_t zero[4] = {0};
         gnssDataChar->setValue(zero, 4);
         gnssDataChar->notify();
+        vSemaphoreDelete(gnssAckSem);
+        gnssAckSem = nullptr;
         gnssXferActive = false;
         vTaskDelete(nullptr);
         return;
     }
 
     uint32_t fileSize = (uint32_t)f.size();
-    const uint16_t CHUNK = 182;
-    uint8_t buf[182 + 4];
+    systemPrintf("gnssXfer: fileSize=%u bytes\r\n", (unsigned)fileSize);
+    // 500 bytes fits within negotiated MTU of 517 (514 max GATT payload).
+    const uint16_t CHUNK = 500;
+    uint8_t buf[500 + 4];
 
-    // First packet includes the 4-byte file-size header.
+    bool ok = true;
+
+    // First packet: 4-byte size header + up to CHUNK bytes of data.
     buf[0] = (uint8_t)(fileSize & 0xFF);
     buf[1] = (uint8_t)((fileSize >>  8) & 0xFF);
     buf[2] = (uint8_t)((fileSize >> 16) & 0xFF);
@@ -183,26 +260,42 @@ static void gnssXferTask(void *e)
     {
         gnssDataChar->setValue(buf, (size_t)(4 + n));
         gnssDataChar->notify();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // Wait up to 5 s for phone to ACK before sending next chunk.
+        if (xSemaphoreTake(gnssAckSem, pdMS_TO_TICKS(5000)) != pdTRUE)
+        {
+            systemPrintln("gnssXfer: ACK timeout on first chunk — aborting");
+            ok = false;
+        }
     }
 
-    while (gnssXferActive)
+    while (ok && gnssXferActive)
     {
         n = f.read(buf, CHUNK);
         if (n <= 0) break;
         gnssDataChar->setValue(buf, (size_t)n);
         gnssDataChar->notify();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (xSemaphoreTake(gnssAckSem, pdMS_TO_TICKS(5000)) != pdTRUE)
+        {
+            systemPrintf("gnssXfer: ACK timeout after %u bytes — aborting\r\n",
+                         (unsigned)f.position());
+            break;
+        }
     }
 
     f.close();
-    gnssXferActive = false;
+    systemPrintln("gnssXfer: transfer complete");
+
+    vSemaphoreDelete(gnssAckSem);
+    gnssAckSem = nullptr;
 
     // Free the space and immediately start a fresh obs file for the next capture.
+    // Clear gnssXferActive AFTER gnssOpenRawFile() so that memsBleUpdate() cannot
+    // win the race between this task's remove() and open() calls.
     LittleFS.remove(gnssRawFileName);
     gnssRawFileName[0] = 0;
-    if (online.fs && online.rtc)
+    if (online.fs)
         gnssOpenRawFile();
+    gnssXferActive = false;
 
     vTaskDelete(nullptr);
 }
@@ -218,8 +311,8 @@ void memsBleInit()
         return;
     }
 
-    // Handle space: 1 service + 3+2+3+2+3 chars/descriptors = 14 → use 24 for headroom.
-    BLEService *svc = srv->createService(BLEUUID(MEMS_SERVICE_UUID), 24);
+    // Handle space: 1 service + 3+2+3+2+3+3 chars/descriptors = 17 → use 30 for headroom.
+    BLEService *svc = srv->createService(BLEUUID(MEMS_SERVICE_UUID), 30);
 
     // 4d360002 — IMU frame notify (existing)
     memsChar = svc->createCharacteristic(BLEUUID(MEMS_CHAR_UUID),
@@ -249,10 +342,15 @@ void memsBleInit()
                                               BLECharacteristic::PROPERTY_WRITE_NR);
     gnssCtrlChar->setCallbacks(&gnssCtrlCb);
 
-    // 4d360006 — raw obs data stream (notify, Torch → phone)
+    // 4d360006 — raw obs data stream (notify, Torch → phone, post-capture file download)
     gnssDataChar = svc->createCharacteristic(BLEUUID(GNSS_DATA_UUID),
                                               BLECharacteristic::PROPERTY_NOTIFY);
     gnssDataChar->addDescriptor(new BLE2902());
+
+    // 4d360007 — live RTCM3 obs stream (notify, Torch → phone, during capture)
+    gnssStreamChar = svc->createCharacteristic(BLEUUID(GNSS_STREAM_UUID),
+                                                BLECharacteristic::PROPERTY_NOTIFY);
+    gnssStreamChar->addDescriptor(new BLE2902());
 
     svc->start();
 
@@ -262,6 +360,12 @@ void memsBleInit()
 
     memsBleInited = true;
     systemPrintln("MEMS BLE ready: IMU(4d360002) RTCM(4d360003) Status(4d360004) GNSS(4d360005/06)");
+
+    // Open the obs log immediately — beginFS() runs in setup long before BLE,
+    // so online.fs is guaranteed true here. This decouples obs logging from the
+    // tilt state machine (which may not run if tilt compensation is disabled).
+    if (online.fs)
+        gnssOpenRawFile();
 }
 
 void memsBleUpdate()
@@ -269,8 +373,9 @@ void memsBleUpdate()
     if (!memsBleInited || memsChar == nullptr)
         return;
 
-    // ── Raw obs log — open once LittleFS and RTC are both ready ─────────────
-    if (!gnssRawFile && online.fs && online.rtc)
+    // ── Raw obs log — open once LittleFS is ready, but never while a transfer
+    // is in progress (would truncate the file the xfer task is about to read).
+    if (!gnssRawFile && !gnssXferActive && online.fs)
         gnssOpenRawFile();
 
     // ── IMU frames ──────────────────────────────────────────────────────────
@@ -294,11 +399,11 @@ void memsBleUpdate()
         }
     }
 
-    // ── Fix status (1 Hz) ───────────────────────────────────────────────────
+    // ── Fix status (10 Hz) ──────────────────────────────────────────────────
     if (statusChar == nullptr || gnss == nullptr) return;
 
     static unsigned long lastStatus = 0;
-    if (millis() - lastStatus < 1000) return;
+    if (millis() - lastStatus < 100) return;
     lastStatus = millis();
 
     uint8_t fixCat = 0;
@@ -320,7 +425,25 @@ void memsBleUpdate()
         tUtc = gnss->getHour() * 3600.0f + gnss->getMinute() * 60.0f
                + gnss->getSecond() + gnss->getNanosecond() * 1e-9f;
 
-    uint8_t status[16];
+    // Roll/pitch from the raw-accel/gyro complementary filter (tiltProcessMEMS()) —
+    // not the IM19 NAVI Kalman output, which needs a hand-shake init a vehicle
+    // mount can't perform. Heading still comes from NAVI (0.0 when uninitialized,
+    // which is expected here); the app falls back to GNSS course_deg for heading.
+    float rollDeg    = cfRollRad * RAD_TO_DEG;
+    float pitchDeg   = cfPitchRad * RAD_TO_DEG;
+    float headingDeg = tiltSensor != nullptr ? tiltSensor->getNaviHeading()    : 0.0f;
+
+    // Ellipsoidal altitude (m) from GNSS; IM19 NAVI status word for convergence gating.
+    float    altM      = gnss->getAltitude();
+    uint32_t naviStat  = tiltSensor != nullptr ? tiltSensor->getNaviStatus() : 0;
+
+    // Doppler velocity from BESTNAV (GNSS source).
+    float speedMps  = (float)gnss->getHorizontalSpeed(); // horizontal speed, m/s
+    float courseDeg = (float)gnss->getTrackGround();     // course over ground, deg CW from N
+    float velDMps   = -(float)gnss->getVerticalSpeed();  // vertical, m/s positive-DOWN
+    float sVelMps   = gnss->getSpeedDeviation();         // horizontal speed accuracy, m/s
+
+    uint8_t status[52];
     status[0] = fixCat;
     status[1] = sats;
     status[2] = (uint8_t)(hAccMm & 0xFF);
@@ -333,8 +456,17 @@ void memsBleUpdate()
     status[9]  = (uint8_t)((lonI >>  8) & 0xFF);
     status[10] = (uint8_t)((lonI >> 16) & 0xFF);
     status[11] = (uint8_t)((lonI >> 24) & 0xFF);
-    memcpy(&status[12], &tUtc, 4); // float32 LE
-    statusChar->setValue(status, 16);
+    memcpy(&status[12], &tUtc,       4); // float32 LE
+    memcpy(&status[16], &rollDeg,    4); // float32 LE, +right-side-down
+    memcpy(&status[20], &pitchDeg,   4); // float32 LE, +nose-up
+    memcpy(&status[24], &headingDeg, 4); // float32 LE, true heading 0=N 90=E
+    memcpy(&status[28], &altM,       4); // float32 LE, ellipsoidal altitude (m)
+    memcpy(&status[32], &naviStat,   4); // uint32 LE, IM19 NAVI status word
+    memcpy(&status[36], &speedMps,   4); // float32 LE, horizontal speed (m/s)
+    memcpy(&status[40], &courseDeg,  4); // float32 LE, course over ground (deg CW from N)
+    memcpy(&status[44], &velDMps,    4); // float32 LE, vertical speed positive-down (m/s)
+    memcpy(&status[48], &sVelMps,    4); // float32 LE, horizontal speed accuracy (m/s)
+    statusChar->setValue(status, 52);
     statusChar->notify();
 }
 
@@ -607,6 +739,56 @@ void printTiltDebug()
     }
 }
 
+// Complementary-filter roll/pitch, derived from the raw 100 Hz MEMS accel/gyro
+// stream instead of the IM19's Kalman NAVI output. The NAVI filter requires a
+// hand-shake init sequence (see datasheet steps in tiltUpdate() above) that a
+// vehicle-fixed mount can never perform, so it never leaves TILT_INITIALIZED.
+// This filter needs no init gesture: gyro integration gives continuous fast
+// response, and the accelerometer's gravity vector pulls out long-term drift
+// whenever the vehicle isn't under significant non-gravity acceleration
+// (braking/accelerating/cornering), which is when the accel reading stops
+// looking like 1 g and the correction is skipped for that sample.
+// Sign convention: roll +right-side-down, pitch +nose-down (memsBleUpdate()
+// below) — verified on bench 2026-08-05. (Torch
+// flat: expect az≈+1g, ax≈ay≈0) before trusting the sign in the field, since
+// it assumes the IMU's Z axis is vertical when the unit sits normally in its
+// mount. cfRollRad/cfPitchRad themselves are declared at file scope near the
+// top of this file (read by memsBleUpdate(), which appears earlier).
+static bool cfInited = false;
+
+static void tiltComplementaryFilterUpdate(float ax, float ay, float az, float gx, float gy, float dt)
+{
+    // Bench-verified 2026-08-05: this unit's IMU reports az≈-1g (not +1g) when
+    // resting level in its normal mounted orientation — Z is the up/down axis,
+    // but inverted from the textbook convention. Negate az here so "level" comes
+    // out as roll≈0°/pitch≈0° instead of wrapping to ≈180°.
+    float accMag = sqrtf(ax * ax + ay * ay + az * az);
+    float accelRoll  = atan2f(ay, -az);
+    float accelPitch = atan2f(ax, sqrtf(ay * ay + az * az));
+
+    if (!cfInited)
+    {
+        cfRollRad = accelRoll;
+        cfPitchRad = accelPitch;
+        cfInited = true;
+        return;
+    }
+
+    // Gyro integration every sample (rad/s * s = rad) — carries us through
+    // the periods where the accel correction below is gated out.
+    cfRollRad  += gx * dt;
+    cfPitchRad += gy * dt;
+
+    // Only trust the accelerometer as "down" when it's close to 1 g — otherwise
+    // the vehicle is accelerating/braking/turning and the reading isn't gravity.
+    if (fabsf(accMag - 1.0f) < 0.1f)
+    {
+        const float alpha = 0.98f; // gyro:accel trust ratio per correction step
+        cfRollRad  = alpha * cfRollRad  + (1.0f - alpha) * accelRoll;
+        cfPitchRad = alpha * cfPitchRad + (1.0f - alpha) * accelPitch;
+    }
+}
+
 // Called every main loop iteration — captures each new MEMS frame into the ring buffer
 // and logs at 1 Hz so we can confirm data is flowing.
 void tiltProcessMEMS()
@@ -621,17 +803,36 @@ void tiltProcessMEMS()
     double t = tiltSensor->getMemsTimestamp();
     if (t == lastSeen)
         return;
+    double dt = (lastSeen >= 0.0) ? (t - lastSeen) : 0.0;
     lastSeen = t;
 
-    MemsFrame f = { t,
-        tiltSensor->getMemsAccelX(), tiltSensor->getMemsAccelY(), tiltSensor->getMemsAccelZ(),
-        tiltSensor->getMemsGyroX(),  tiltSensor->getMemsGyroY(),  tiltSensor->getMemsGyroZ() };
+    float ax = tiltSensor->getMemsAccelX(), ay = tiltSensor->getMemsAccelY(), az = tiltSensor->getMemsAccelZ();
+    float gx = tiltSensor->getMemsGyroX(),  gy = tiltSensor->getMemsGyroY(),  gz = tiltSensor->getMemsGyroZ();
+
+    // Clamp dt so a startup sample or a stall doesn't inject a huge gyro step.
+    if (dt > 0.0 && dt < 0.05)
+        tiltComplementaryFilterUpdate(ax, ay, az, gx, gy, (float)dt);
+
+    MemsFrame f = { t, ax, ay, az, gx, gy, gz };
     // Push to ring buffer (inline to avoid Arduino prototype-injector issue with MemsFrame in sig)
     {
         uint8_t next = (memsHead + 1) & (MEMS_RING_SIZE - 1);
         if (next != memsTail) { memsRing[memsHead] = f; memsHead = next; }
     }
 
+    // Bench-test aid: 1 Hz print of raw accel + the complementary-filter roll/pitch,
+    // so the sign convention can be checked over USB serial without app changes.
+    // Enable via the menu's IMU debug toggle (same flag as printTiltDebug()).
+    if (settings.enableImuDebug == true)
+    {
+        static unsigned long lastPrint = 0;
+        if (millis() - lastPrint > 1000)
+        {
+            lastPrint = millis();
+            systemPrintf("MEMS accel g(x,y,z)=(%0.3f,%0.3f,%0.3f) roll=%0.1f pitch=%0.1f\r\n",
+                         ax, ay, az, cfRollRad * RAD_TO_DEG, cfPitchRad * RAD_TO_DEG);
+        }
+    }
 }
 
 // Start communication with the IM19 IMU
