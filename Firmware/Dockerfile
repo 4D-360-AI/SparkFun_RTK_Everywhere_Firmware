@@ -110,6 +110,9 @@ FROM upstream AS deployment
 # Add the source files
 ADD . .
 
+# Patch IM19 library with MEMS frame support (adds packetMems, getters, eomHandler case)
+COPY ./RTK_Everywhere/patches/SparkFun_IM19_IMU/ /root/Arduino/libraries/SparkFun_IM19_IMU_Arduino_Library/src/
+
 # Install private accessory and authentication coprocessor libraries
 RUN if [ "$COMPILE_AUTHENTICATION" = "false" ] ; \
     then echo 'Skipping COMPILE_AUTHENTICATION'; \

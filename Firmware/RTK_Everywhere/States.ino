@@ -101,6 +101,7 @@ void stateUpdate()
 
             // Start Bluetooth if it is not already started
             bluetoothStartWithSettings();
+            memsBleInit(); // Register 4d360001 service before any BLE client can connect
 
             baseCasterDisableOverride(); // Disable casting overrides
 
@@ -296,6 +297,7 @@ void stateUpdate()
 
             // Start Bluetooth if it is not already started
             bluetoothStartWithSettings();
+            memsBleInit(); // Register 4d360001 service before any BLE client can connect
 
             // Start the UART connected to the GNSS receiver for NMEA data (enables logging)
             if (tasksStartGnssUart())

@@ -147,6 +147,15 @@ void checkGNSSArrayDefaults()
             for (int x = 0; x < MAX_UM980_RTCM_MSG; x++)
                 settings.um980MessageRatesRTCMBase[x] = umMessagesRTCM[x].msgDefaultRate;
         }
+
+        // One-shot migration: upgrade the old 2 Hz default (500 ms) to 10 Hz (100 ms).
+        // Only fires when the saved value is exactly the old default; user-chosen values
+        // other than 500 are left untouched.
+        if (settings.measurementRateMs == 500)
+        {
+            defaultsApplied = true;
+            settings.measurementRateMs = 100;
+        }
     }
 #endif // COMPILE_UM980
 
@@ -307,7 +316,7 @@ void checkGNSSArrayDefaults()
         {
             settings.minCN0 = 10;                    // Default 10 dBHz
             settings.surveyInStartingAccuracy = 2.0; // Default 2m
-            settings.measurementRateMs = 500;        // Default 2Hz.
+            settings.measurementRateMs = 100;        // Default 10Hz.
         }
         else if (present.gnss_zedf9p || present.gnss_zedx20p)
         {

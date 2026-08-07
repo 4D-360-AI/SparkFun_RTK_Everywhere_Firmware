@@ -251,6 +251,11 @@ class GNSS_UM980 : GNSS
     //   Returns the horizontal position accuracy or zero if offline
     float getHorizontalAccuracy();
 
+    double getHorizontalSpeed();
+    double getTrackGround();
+    double getVerticalSpeed();
+    float  getSpeedDeviation();
+
     const char *getId();
 
     // Get the latitude value

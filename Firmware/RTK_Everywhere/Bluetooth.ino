@@ -639,9 +639,11 @@ void bluetoothStart(bool onlineCheck)
                 recordSystemSettings();
             }
 
+#ifdef COMPILE_AUTHENTICATION
             // The SDP callback will create the iAP2 record
             esp_sdp_register_callback(esp_sdp_callback);
             esp_sdp_init();
+#endif // COMPILE_AUTHENTICATION
         }
 
         beginSuccess &= bluetoothSerialBle->begin(

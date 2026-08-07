@@ -185,6 +185,12 @@ class GNSS
     //   Returns the horizontal position accuracy or zero if offline
     virtual float getHorizontalAccuracy();
 
+    // Doppler velocity from BESTVELB / BESTNAV (returns 0 on unsupported receivers)
+    virtual double getHorizontalSpeed() { return 0.0; } // m/s, horizontal scalar
+    virtual double getTrackGround()     { return 0.0; } // degrees CW from North
+    virtual double getVerticalSpeed()   { return 0.0; } // m/s, positive up
+    virtual float  getSpeedDeviation()  { return 0.0f; } // m/s horizontal accuracy
+
     virtual const char *getId();
 
     // Get the latitude value

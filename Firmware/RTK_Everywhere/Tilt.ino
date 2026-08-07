@@ -420,10 +420,34 @@ void memsBleUpdate()
     int32_t lonI = (int32_t)(gnss->getLongitude() * 1e7);
 
     // UTC seconds-of-day (float32). 0.0 signals "not yet valid".
+    // RECTIMEB fires at 1 Hz on the whole-second boundary (ms≈0). Anchor it to
+    // ESP32 millis() when the second changes, then dead-reckon at the 100 ms BLE
+    // rate. This gives 1 ms sub-second precision without any library changes.
+    static uint32_t rectimeAnchorMillis = 0; // millis() when RECTIMEB last ticked
+    static uint32_t rectimeSodMs        = 0; // UTC ms-of-day at that tick
+    static uint8_t  rectimeLastSec      = 255;
+
     float tUtc = 0.0f;
     if (gnss->isConfirmedTime())
-        tUtc = gnss->getHour() * 3600.0f + gnss->getMinute() * 60.0f
-               + gnss->getSecond() + gnss->getNanosecond() * 1e-9f;
+    {
+        uint8_t nowSec = gnss->getSecond();
+        if (nowSec != rectimeLastSec)
+        {
+            // New RECTIMEB epoch — refresh the dead-reckoning anchor.
+            rectimeLastSec      = nowSec;
+            rectimeAnchorMillis = millis();
+            rectimeSodMs        = (uint32_t)gnss->getHour()   * 3600000UL
+                                + (uint32_t)gnss->getMinute() *   60000UL
+                                + (uint32_t)nowSec            *    1000UL
+                                + gnss->getMillisecond();
+        }
+        if (rectimeAnchorMillis != 0)
+        {
+            uint32_t sodMs = rectimeSodMs + (millis() - rectimeAnchorMillis);
+            if (sodMs >= 86400000UL) sodMs -= 86400000UL; // midnight wrap
+            tUtc = sodMs / 1000.0f;
+        }
+    }
 
     // Roll/pitch from the raw-accel/gyro complementary filter (tiltProcessMEMS()) —
     // not the IM19 NAVI Kalman output, which needs a hand-shake init a vehicle

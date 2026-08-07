@@ -644,6 +644,30 @@ float GNSS_UM980::getHorizontalAccuracy()
 }
 
 //----------------------------------------
+// Doppler velocity from BESTNAV (BESTNAVB binary message, updated at fix rate)
+//----------------------------------------
+double GNSS_UM980::getHorizontalSpeed()
+{
+    if (online.gnss) return _um980->getHorizontalSpeed();
+    return 0.0;
+}
+double GNSS_UM980::getTrackGround()
+{
+    if (online.gnss) return _um980->getTrackGround();
+    return 0.0;
+}
+double GNSS_UM980::getVerticalSpeed()
+{
+    if (online.gnss) return _um980->getVerticalSpeed();
+    return 0.0;
+}
+float GNSS_UM980::getSpeedDeviation()
+{
+    if (online.gnss) return _um980->getHorizontalSpeedDeviation();
+    return 0.0f;
+}
+
+//----------------------------------------
 // Returns the hours of 24 hour clock or zero if not online
 //----------------------------------------
 uint8_t GNSS_UM980::getHour()
@@ -1739,6 +1763,10 @@ bool GNSS_UM980::setMessagesNMEA()
     // We called disableAllOutput() above. So we also need to restart NMEA for Tilt on COM2
     response &= setTilt(); // Returns true if present.imu_im19 is false, which it should never be...
 
+    // 4D-360: force BESTNAVB to 10 Hz here unconditionally — setTilt() may return early
+    // if present.imu_im19 is false, leaving BESTNAVB at whatever is in UM980 flash (1 Hz).
+    _um980->sendCommand("BESTNAVB COM3 0.1");
+
     if (response == true)
     {
         um980MessagesEnabled_NMEA.enabled = true;
@@ -2022,6 +2050,10 @@ bool GNSS_UM980::setTilt()
 
     // Read, modify, write
     // The UM980 does not have a way to read the currently enabled messages so we do only a write
+    // 4D-360: force BESTNAVB to 10 Hz unconditionally — the UM980 retains the
+    // previous rate in flash and lazy-init alone won't override it.
+    _um980->sendCommand("BESTNAVB COM3 0.1");
+
     if (settings.enableTiltCompensation == true)
     {
         // Configure UM980 to output binary and NMEA reports out COM2,
