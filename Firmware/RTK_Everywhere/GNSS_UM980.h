@@ -46,12 +46,37 @@ typedef struct
 } um980Msg;
 
 // Static array containing all the compatible messages
-// Rate = Reports per second
+//
+// The value is a PERIOD IN SECONDS, not a rate in Hz. 0.5 => 2 Hz, 10 => 0.1 Hz,
+// 0 => off. See GNSS_UM980::begin() where 0.2 is commented "5Hz". The previous
+// comment here read "Rate = Reports per second", which is backwards: anyone
+// "raising the rate to 10" would silently get 0.1 Hz.
+//
+// 4D-360 CAPTURE PROFILE. On capture 019fd46a the BLE link to the tablet
+// delivered 5.18 kB/s. NMEA took 55.6% of it and the raw carrier-phase
+// observations that PPK consumes got 15.5%, which fragmented the phase badly
+// enough that ambiguity resolution fixed 19% of epochs against 87.5% real-time.
+// Measured NMEA cost on that capture:
+//
+//     GSV  33.2 sentences/s  1.98 kB/s  38% of the ENTIRE link
+//     GSA   8.0              0.42 kB/s
+//     GGA   2.0              0.18 kB/s
+//     RMC   2.0              0.17 kB/s
+//     GST   2.0              0.12 kB/s
+//
+// GSV and GSA are off: both are diagnostics (satellites in view, DOP) that the
+// tablet does not consume, and GSV repeats per constellation AND per signal band,
+// which is why it dominates.
+//
+// GPGGA IS DELIBERATELY LEFT ON. GNSS_UM980::begin() branches on isGgaActive():
+// with GGA off the UM980 library takes the enableBinaryBeforeFix() path and
+// configuration takes longer at power-on. It costs 0.18 kB/s, so leaving it on is
+// cheap insurance against a slow cold start in the field.
 const um980Msg umMessagesNMEA[] = {
     // NMEA
     {"GPDTM", 0}, {"GPGBS", 0},   {"GPGGA", 0.5}, {"GPGLL", 0}, {"GPGNS", 0},
 
-    {"GPGRS", 0}, {"GPGSA", 0.5}, {"GPGST", 0.5}, {"GPGSV", 1}, {"GPRMC", 0.5},
+    {"GPGRS", 0}, {"GPGSA", 0},   {"GPGST", 0.5}, {"GPGSV", 0}, {"GPRMC", 0},
 
     {"GPROT", 0}, {"GPTHS", 0},   {"GPVTG", 0},   {"GPZDA", 0},
 };
@@ -62,13 +87,13 @@ const um980Msg umMessagesRTCM[] = {
     {"RTCM1001", 0},  {"RTCM1002", 0}, {"RTCM1003", 0}, {"RTCM1004", 0}, {"RTCM1005", 1},
     {"RTCM1006", 0},  {"RTCM1007", 0}, {"RTCM1009", 0}, {"RTCM1010", 0},
 
-    {"RTCM1011", 0},  {"RTCM1012", 0}, {"RTCM1013", 0}, {"RTCM1019", 0},
+    {"RTCM1011", 0},  {"RTCM1012", 0}, {"RTCM1013", 0}, {"RTCM1019", 30},
 
-    {"RTCM1020", 0},
+    {"RTCM1020", 30},
 
     {"RTCM1033", 10},
 
-    {"RTCM1042", 0},  {"RTCM1044", 0}, {"RTCM1045", 0}, {"RTCM1046", 0},
+    {"RTCM1042", 30},  {"RTCM1044", 30}, {"RTCM1045", 30}, {"RTCM1046", 30},
 
     {"RTCM1071", 0},  {"RTCM1072", 0}, {"RTCM1073", 0}, {"RTCM1074", 1}, {"RTCM1075", 0},
     {"RTCM1076", 0},  {"RTCM1077", 0},
