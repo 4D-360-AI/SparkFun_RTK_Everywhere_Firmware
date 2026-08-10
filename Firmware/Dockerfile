@@ -7,6 +7,10 @@ ARG CORE_VERSION=3.0.7
 ARG FIRMWARE_VERSION_MAJOR=99
 ARG FIRMWARE_VERSION_MINOR=99
 
+# Short git sha of the tree being built. Lands in rtkFirmwareVersion as
+# "d99.99+abc1234" — what lets a capture name the firmware that produced it.
+ARG FIRMWARE_COMMIT=unknown
+
 # ESP32 Core Debug Level
 # We use "none" for releases and "error" for release_candidate
 # You may find "verbose" useful while you are debugging your changes
@@ -152,6 +156,12 @@ RUN if [ "$COMPILE_AUTHENTICATION" = "false" ] ; \
     ; fi
 
 # Patch libmbedtls and libbt
+# Bake the build's git sha in as a header. A -D would have to survive Docker ->
+# /bin/sh -> arduino-cli --build-property, which is four levels of quoting; this
+# has none. rtkFirmwareVersion then reads "d99.99+abc1234" instead of "d99.99",
+# which is the difference between a capture naming its firmware and not.
+RUN echo "#define FIRMWARE_COMMIT \"${FIRMWARE_COMMIT}\"" > ./RTK_Everywhere/firmware_commit.h
+
 RUN cd ./RTK_Everywhere/Patch \
     && ESP_IDF=$(ls /root/.arduino15/packages/esp32/tools/esp32-arduino-libs | grep idf-release) \
     && echo "ESP IDF Version: ${ESP_IDF}" \
