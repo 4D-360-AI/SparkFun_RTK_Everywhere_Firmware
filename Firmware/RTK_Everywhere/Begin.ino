@@ -1018,12 +1018,78 @@ void beginGnssUart()
     }
 }
 
+// The rates a UM980 will accept. Duplicated from um980AllowedBaudRates because that lives on
+// the GNSS object, which does not exist yet when the UART is being brought up.
+static bool baudIsAllowedForTorch(uint32_t b)
+{
+    return b == 9600 || b == 19200 || b == 38400 || b == 57600 || b == 115200 ||
+           b == 230400 || b == 460800 || b == 921600;
+}
+
+// Does the UM980 answer at this baud? Sends VERSION and looks for its reply.
+//
+// The receiver is the authority on its own baud, and asking costs ~250 ms. Assuming costs a
+// unit: settings.dataPortBaud and the override below are both guesses about a rate that
+// lives in the RECEIVER'S flash, and when the two disagree the ESP32 sees noise and the
+// Torch goes mute about its own GNSS with nothing on screen to say why.
+static bool um980RespondsAt(uint32_t baud)
+{
+    serialGNSS->updateBaudRate(baud);
+    delay(50);
+    while (serialGNSS->available())
+        serialGNSS->read();                 // discard noise framed at the previous rate
+    serialGNSS->print("VERSION\r\n");
+    uint32_t t0 = millis();
+    String reply = "";
+    while (millis() - t0 < 250)
+    {
+        while (serialGNSS->available())
+            reply += (char)serialGNSS->read();
+        if (reply.indexOf("VERSION") >= 0 || reply.indexOf("UM98") >= 0)
+            return true;
+        delay(5);
+    }
+    return false;
+}
+
+// Find the rate the receiver is ACTUALLY at, preferring `preferred`.
+//
+// Returns `preferred` unchanged when nothing answers, so a failed probe leaves the device
+// behaving exactly as it did before this function existed. That property is the point: this
+// replaces a hard-coded 115200 and must not be able to do worse than it.
+static uint32_t probeUm980Baud(uint32_t preferred)
+{
+    const uint32_t candidates[] = {921600, 460800, 230400, 115200};
+    if (um980RespondsAt(preferred))
+        return preferred;
+    for (uint32_t c : candidates)
+    {
+        if (c == preferred)
+            continue;
+        if (um980RespondsAt(c))
+        {
+            systemPrintf("GNSS UART: receiver answered at %lu, not the configured %lu\r\n",
+                         (unsigned long)c, (unsigned long)preferred);
+            return c;
+        }
+    }
+    systemPrintf("GNSS UART: no reply at any rate; staying at %lu\r\n",
+                 (unsigned long)preferred);
+    serialGNSS->updateBaudRate(preferred);
+    return preferred;
+}
+
 void forceGnssCommunicationRate(uint32_t &platformGnssCommunicationRate)
 {
     if (productVariant == RTK_TORCH)
     {
-        // Override user setting. Required because beginGnssUart() is called before beginBoard().
-        platformGnssCommunicationRate = 115200;
+        // The Torch UM980 ships at 115200, and 20 Hz raw does not fit in it (~16 kB/s
+        // against 11.5). Prefer whatever is configured; beginGnssUart() then PROBES, so a
+        // receiver already moved to 460800/921600 is found rather than lost.
+        if (baudIsAllowedForTorch(settings.dataPortBaud))
+            platformGnssCommunicationRate = settings.dataPortBaud;
+        else
+            platformGnssCommunicationRate = 115200;
     }
     else if (productVariant == RTK_POSTCARD || productVariant == RTK_TORCH_X2)
     {
@@ -1101,6 +1167,13 @@ void pinGnssUartTask(void *pvParameters)
     serialGNSS->begin(platformGnssCommunicationRate, SERIAL_8N1, pin_GnssUart_RX,
                       pin_GnssUart_TX); // Start UART on platform dependent pins for SPP. The GNSS will be
                                         // configured to output NMEA over its UART at the same rate.
+
+    // ASK THE RECEIVER, do not assume. beginBoard() has already run (RTK_Everywhere.ino
+    // calls it at ~1332, well before this at ~1422), so the mux connects ESP UART1 to the
+    // UM980 and the receiver can answer. Without this, raising the receiver's baud leaves
+    // the Torch mute about its own GNSS, recoverable only over USB.
+    if (productVariant == RTK_TORCH)
+        platformGnssCommunicationRate = probeUm980Baud(platformGnssCommunicationRate);
 
     // Reduce threshold value above which RX FIFO full interrupt is generated
     // Allows more time between when the UART interrupt occurs and when the FIFO buffer overruns
