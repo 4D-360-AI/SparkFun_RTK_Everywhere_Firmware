@@ -466,6 +466,10 @@ class GNSS_UM980 : GNSS
     bool setLogging();
 
     // Turn on all the enabled NMEA messages on COM3
+    // 4D-360: the message profile our pipeline consumes (OBSVMB + BESTNAVB +
+    // ephemeris), at a rate derived from the link so it cannot over-subscribe it.
+    bool um980Apply4d360Profile();
+
     bool setMessagesNMEA();
 
     // Turn on all the enabled RTCM Rover messages on COM3
