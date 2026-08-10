@@ -1175,6 +1175,12 @@ void pinGnssUartTask(void *pvParameters)
     if (productVariant == RTK_TORCH)
         platformGnssCommunicationRate = probeUm980Baud(platformGnssCommunicationRate);
 
+    // Publish what the link ACTUALLY ended up at. The probe may have landed somewhere other
+    // than settings.dataPortBaud, and the message profile has to be sized against the real
+    // rate: choosing 20 Hz for a link running at 115200 is 685% of it, and an over-subscribed
+    // UART drops bytes silently rather than reporting an error.
+    gnssUartActualBaud = platformGnssCommunicationRate;
+
     // Reduce threshold value above which RX FIFO full interrupt is generated
     // Allows more time between when the UART interrupt occurs and when the FIFO buffer overruns
     serialGNSS->setRxFIFOFull(settings.serialGNSSRxFullThreshold);

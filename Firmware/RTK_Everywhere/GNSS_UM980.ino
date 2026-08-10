@@ -1678,6 +1678,95 @@ bool GNSS_UM980::setMinCN0(uint8_t cn0Value)
 // NOTE: This is specific to Torch where ESP32 is connected to COM3
 // TODO: Update this if we add UM980 on Facet FP
 //----------------------------------------
+//----------------------------------------
+// 4D-360: the message profile our pipeline consumes, on COM3 (ESP32 <-> UM980).
+//
+// WHY THIS IS IN THE FIRMWARE and not in an external configuration script: setMessagesNMEA()
+// calls disableAllOutput() (UNLOG) and then reapplies this firmware's own list, saving the
+// result to NVM. Anything a PC-side tool sets gets wiped on the next config pass. The firmware
+// owns this receiver's message profile, so the only durable place to add ours is here.
+//
+// WHAT THE PIPELINE NEEDS, and nothing else:
+//   OBSVMB     raw observations. RTKLIB demo5 decodes these natively (ID_OBSVM = 12). RTCM3
+//              MSM was a transport of convenience and its framing is what fragmented the
+//              carrier phase on the 0804 capture.
+//   BESTNAVB   position, pos_type and per-epoch standard deviations, at the SAME rate --
+//              bestnav_trajectory.py uses it to bound scale drift between GNSS anchors, and a
+//              weight that exists on 1 epoch in 20 is not a per-epoch weight.
+//   *EPHB      broadcast ephemeris, ONCHANGED. Makes the log self-contained, so post-
+//              processing needs no external ephemeris download.
+//
+// Headroom is not permission to log more. Anything added here has to be carried by the link,
+// stored, sealed, uploaded, and explained by whoever opens the bundle later.
+//----------------------------------------
+
+// Target raw-observation rate. 20 Hz is set by the 100 km/h design speed.
+#define FOURD360_RAW_RATE_HZ 20.0f
+
+// MEASURED on capture 019fd46a, not estimated: BESTNAVB is 148 B/message across 8037 messages,
+// and the raw observations ran 3.80 kB/s at 1 Hz. The obs figure is an UPPER BOUND -- that
+// capture logged RTCM3 MSM and this profile logs OBSVMB, which is more compact by an amount
+// nobody has measured yet. Erring high is the safe direction: it can pick a rate lower than
+// necessary, but it cannot over-subscribe the link.
+#define FOURD360_BESTNAV_BYTES 148.0f
+#define FOURD360_OBS_BYTES_PER_EPOCH 3800.0f
+
+// Pick the highest rate at or below the target that fits `baud`, leaving a little margin.
+//
+// An over-subscribed UART does not report itself. It drops bytes, which arrives downstream as
+// missing epochs and broken carrier phase -- indistinguishable from poor sky view, and exactly
+// the failure this whole profile exists to remove. So the rate is DERIVED from the link rather
+// than asserted, and whatever it picks is printed.
+float um9804d360RateFor(uint32_t baud)
+{
+    const float capacity = (float)baud / 10.0f * 0.85f;   // 8N1: 10 bits on the wire per byte
+    const float perEpoch = FOURD360_OBS_BYTES_PER_EPOCH + FOURD360_BESTNAV_BYTES;
+    float rate = capacity / perEpoch;
+    if (rate > FOURD360_RAW_RATE_HZ)
+        rate = FOURD360_RAW_RATE_HZ;
+    if (rate < 1.0f)
+        rate = 1.0f;      // below this the receiver is unusable anyway; say so rather than mute it
+    return rate;
+}
+
+bool GNSS_UM980::um980Apply4d360Profile()
+{
+    bool response = true;
+
+    const uint32_t baud = gnssUartActualBaud;
+    const float rate = um9804d360RateFor(baud);
+    const float period = 1.0f / rate;
+
+    if (rate < FOURD360_RAW_RATE_HZ)
+        systemPrintf("4D-360: %.0f baud carries only %.1f Hz, not the %.0f Hz target. "
+                     "Raise dataPortBaud to 921600.\r\n",
+                     (double)baud, (double)rate, (double)FOURD360_RAW_RATE_HZ);
+    else
+        systemPrintf("4D-360: raw observations at %.0f Hz on COM3\r\n", (double)rate);
+
+    char cmd[64];
+
+    // Raw observations -- the reason this profile exists.
+    snprintf(cmd, sizeof(cmd), "OBSVMB COM3 %.3f", (double)period);
+    response &= _um980->sendCommand(cmd);
+
+    // Position at the same rate. Previously forced to 10 Hz in two separate places; the rate
+    // now lives in one.
+    snprintf(cmd, sizeof(cmd), "BESTNAVB COM3 %.3f", (double)period);
+    response &= _um980->sendCommand(cmd);
+
+    // Ephemeris, one per constellation, only when it changes. Cheap, and it is what lets the
+    // log be post-processed without fetching broadcast ephemeris from elsewhere.
+    static const char *eph[] = {"GPSEPHB", "GLOEPHB", "GALEPHB", "BDSEPHB", "QZSSEPHB"};
+    for (unsigned i = 0; i < sizeof(eph) / sizeof(eph[0]); i++)
+    {
+        snprintf(cmd, sizeof(cmd), "%s COM3 ONCHANGED", eph[i]);
+        response &= _um980->sendCommand(cmd);
+    }
+
+    return (response);
+}
+
 bool GNSS_UM980::setMessagesNMEA()
 {
     bool response = true;
@@ -1763,9 +1852,10 @@ bool GNSS_UM980::setMessagesNMEA()
     // We called disableAllOutput() above. So we also need to restart NMEA for Tilt on COM2
     response &= setTilt(); // Returns true if present.imu_im19 is false, which it should never be...
 
-    // 4D-360: force BESTNAVB to 10 Hz here unconditionally — setTilt() may return early
-    // if present.imu_im19 is false, leaving BESTNAVB at whatever is in UM980 flash (1 Hz).
-    _um980->sendCommand("BESTNAVB COM3 0.1");
+    // 4D-360: apply our profile unconditionally here — setTilt() may return early if
+    // present.imu_im19 is false, and disableAllOutput() above has just UNLOGged everything,
+    // so without this the receiver would emit nothing the pipeline consumes.
+    response &= um980Apply4d360Profile();
 
     if (response == true)
     {
@@ -2050,9 +2140,9 @@ bool GNSS_UM980::setTilt()
 
     // Read, modify, write
     // The UM980 does not have a way to read the currently enabled messages so we do only a write
-    // 4D-360: force BESTNAVB to 10 Hz unconditionally — the UM980 retains the
-    // previous rate in flash and lazy-init alone won't override it.
-    _um980->sendCommand("BESTNAVB COM3 0.1");
+    // 4D-360: reapply our profile — the UM980 retains the previous rates in flash and
+    // lazy-init alone will not override them.
+    response &= um980Apply4d360Profile();
 
     if (settings.enableTiltCompensation == true)
     {
