@@ -1304,10 +1304,6 @@ volatile bool deadManWalking;
 */
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-// The rate the ESP32 <-> GNSS UART is actually running at, after probing. Set by
-// beginGnssUart(). 115200 until then, which is what the Torch ships at.
-uint32_t gnssUartActualBaud = 115200;
-
 void setup()
 {
     bootTimeString[bootTimeIndex++] = "CPU/Runtime Initialization";
