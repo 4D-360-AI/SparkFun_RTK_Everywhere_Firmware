@@ -2633,8 +2633,54 @@ void um980FirmwareBeginUpdate()
     serialGNSS->setRxBufferSize(settings.uartReceiveBufferSize);
     serialGNSS->setTimeout(settings.serialTimeoutGNSS); // Requires serial traffic on the UART pins for detection
 
+    // FOLLOW THE RECEIVER, do not assume 115200.
+    //
+    // This bridge is the only way to reach the UM980 from a PC on the Torch: USB -> CH342 B ->
+    // ESP32 UART0 -> UART1 -> UM980. Hard-coded at 115200 it went deaf the moment the receiver
+    // was moved to 460800 or 921600 -- which 20 Hz raw observations REQUIRE, 20 Hz being 685%
+    // of 115200. The failure is silent from the PC end: the port opens and nothing answers,
+    // and this is the only remaining route to the receiver, so there is nothing to fall back
+    // to.
+    //
+    // 115200 is tried FIRST and is the fallback, so a receiver that has never been moved
+    // behaves exactly as it did before this change.
+    uint32_t bridgeBaud = 115200;
+    {
+        const uint32_t candidates[] = {115200, 921600, 460800, 230400};
+        for (uint32_t c : candidates)
+        {
+            serialGNSS->begin(c, SERIAL_8N1, pin_GnssUart_RX, pin_GnssUart_TX);
+            delay(50);
+            while (serialGNSS->available())
+                serialGNSS->read();          // discard noise framed at the previous rate
+            serialGNSS->print("VERSION\r\n");
+            uint32_t t0 = millis();
+            String reply = "";
+            bool found = false;
+            while (millis() - t0 < 250)
+            {
+                while (serialGNSS->available())
+                    reply += (char)serialGNSS->read();
+                if (reply.indexOf("VERSION") >= 0 || reply.indexOf("UM98") >= 0)
+                {
+                    found = true;
+                    break;
+                }
+                delay(5);
+            }
+            serialGNSS->end();
+            if (found)
+            {
+                bridgeBaud = c;
+                break;
+            }
+        }
+    }
+    systemPrintf("Bridging USB <-> UM980 at %lu bps\r\n", (unsigned long)bridgeBaud);
+    systemFlush();
+
     // This is OK for Facet FP too. We're using the main GNSS pins.
-    serialGNSS->begin(115200, SERIAL_8N1, pin_GnssUart_RX, pin_GnssUart_TX);
+    serialGNSS->begin(bridgeBaud, SERIAL_8N1, pin_GnssUart_RX, pin_GnssUart_TX);
 
     // UPrecise needs to query the device before entering bootload mode
     // Wait for UPrecise to send bootloader trigger (character T followed by character @) before resetting UM980
