@@ -48,6 +48,131 @@ static volatile uint8_t memsHead = 0, memsTail = 0;
 
 static bool memsBleInited = false;
 
+// ── Sensor link over Wi-Fi (tcpClientPort + 1) ───────────────────────────────────────
+//
+// The Wi-Fi switch moved the GNSS byte stream and nothing else, because the GNSS stream is
+// the one this firmware already fans out from a single ring buffer to Bluetooth, USB, the
+// TCP client, the TCP server and the log alike (Tasks.ino). Our own GATT service was never
+// in that fan-out, so the 100 Hz IMU, the fix status and the corrections write stayed on
+// BLE — measured on capture 019ffbe7 as 92% of the BLE traffic, against a link whose
+// ceiling is 5.18 kB/s. At the target profile (GNSS 20 Hz, IMU 100 Hz) that is ~48 kB/s and
+// BLE cannot carry it.
+//
+// This is the other half. We DIAL the tablet, exactly as tcpClient does for GNSS, so the
+// address to configure stays the tablet's stable one rather than a DHCP lease. One extra
+// port rather than multiplexing into the GNSS socket: that pipe is raw bytes whose decoders
+// resynchronise on their own sync words, and interleaving 32-byte IMU records into it would
+// corrupt the RTCM3/NovAtel decode at the far end.
+//
+// Framing (must match capture/field-app/lib/services/torch_link.dart):
+//     [0] 0xA5  [1] type  [2..3] payload length LE  [4..] payload
+#define SENSOR_MSG_MAGIC        0xA5
+#define SENSOR_MSG_IMU          0x01
+#define SENSOR_MSG_STATUS       0x02
+#define SENSOR_MSG_CORRECTIONS  0x10
+
+static NetworkClient *sensorTcp = nullptr;
+static uint32_t sensorTcpNextTry = 0;
+static uint8_t  sensorRxBuf[2048];
+static uint16_t sensorRxLen = 0;
+
+// True when the tablet is reachable. Not "configured" — a hostname with nothing behind it
+// is the failure this must not report as healthy.
+static bool sensorTcpOnline()
+{
+    return sensorTcp != nullptr && sensorTcp->connected();
+}
+
+static void sensorTcpStop()
+{
+    if (sensorTcp)
+    {
+        sensorTcp->stop();
+        delete sensorTcp;
+        sensorTcp = nullptr;
+    }
+    sensorRxLen = 0;
+}
+
+// Dial the tablet. Retried on a 5 s backoff: the Torch may boot before the hotspot exists,
+// and hammering connect() in the main loop would starve the GNSS handler.
+static void sensorTcpEnsure()
+{
+    if (sensorTcpOnline())
+        return;
+    if (strlen(settings.tcpClientHost) == 0)
+        return;                          // nothing configured; stay on BLE
+    // NO INTERNET GUARD, deliberately. The tablet is on the LAN, not the internet: the
+    // hotspot may have no cell service at all and the sensor link still has to work. Craig
+    // drove into a dead spot on 2026-08-14, NTRIP stopped, and the receiver kept logging
+    // perfectly good raw data — gating this on internet would have thrown that away too.
+    // connect() fails fast when there is no route, and the backoff bounds the cost.
+    if (millis() < sensorTcpNextTry)
+        return;
+    sensorTcpNextTry = millis() + 5000;
+
+    sensorTcpStop();
+    NetworkClient *c = new NetworkClient();
+    if (c->connect(settings.tcpClientHost, settings.tcpClientPort + 1))
+    {
+        c->setNoDelay(true);   // a 100 Hz frame is worth nothing 40 ms late
+        sensorTcp = c;
+        systemPrintf("Sensor link up: %s:%d\r\n",
+                     settings.tcpClientHost, settings.tcpClientPort + 1);
+    }
+    else
+    {
+        delete c;
+    }
+}
+
+// One framed message to the tablet. Silently drops when the link is down — the IMU is a
+// live stream and a backlog of stale frames is worse than a gap the report can see.
+static void sensorTcpSend(uint8_t type, const uint8_t *payload, uint16_t len)
+{
+    if (!sensorTcpOnline())
+        return;
+    uint8_t hdr[4] = {SENSOR_MSG_MAGIC, type, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8)};
+    if (sensorTcp->write(hdr, 4) != 4 || (len && sensorTcp->write(payload, len) != len))
+        sensorTcpStop();   // a short write means the tablet is gone; reconnect rather than
+                           // dribble half-frames the decoder must resynchronise out of
+}
+
+// Corrections arrive on the SAME socket, so the BLE write characteristic can go away rather
+// than linger as a second path to keep in step. Same destination as the BLE callback:
+// gnss->pushRawData(), which the UM980 accepts as a continuous RTCM3 byte stream.
+static void sensorTcpPoll()
+{
+    if (!sensorTcpOnline())
+        return;
+    while (sensorTcp->available() && sensorRxLen < sizeof(sensorRxBuf))
+        sensorRxBuf[sensorRxLen++] = (uint8_t)sensorTcp->read();
+
+    uint16_t i = 0;
+    while (true)
+    {
+        while (i < sensorRxLen && sensorRxBuf[i] != SENSOR_MSG_MAGIC)
+            i++;                                    // resync after a reconnect
+        if ((uint16_t)(sensorRxLen - i) < 4)
+            break;
+        uint16_t len = sensorRxBuf[i + 2] | ((uint16_t)sensorRxBuf[i + 3] << 8);
+        if ((uint16_t)(sensorRxLen - i - 4) < len)
+            break;                                  // wait for the rest
+        if (sensorRxBuf[i + 1] == SENSOR_MSG_CORRECTIONS && gnss != nullptr && len)
+            gnss->pushRawData(&sensorRxBuf[i + 4], (int)len);
+        i += 4 + len;
+    }
+    // Keep the remainder. Without this a message split across reads is lost and every
+    // later frame has to be resynchronised out of the stream.
+    if (i > 0 && i <= sensorRxLen)
+    {
+        memmove(sensorRxBuf, &sensorRxBuf[i], sensorRxLen - i);
+        sensorRxLen -= i;
+    }
+    if (sensorRxLen >= sizeof(sensorRxBuf))
+        sensorRxLen = 0;   // a frame larger than the buffer cannot be ours
+}
+
 // Complementary-filter roll/pitch (radians), fed by tiltComplementaryFilterUpdate()
 // in the COMPILE_IM19_IMU block below. Declared here (file scope, unconditional) so
 // memsBleUpdate() — compiled under COMPILE_BT, and appearing earlier in this file —
@@ -378,6 +503,11 @@ void memsBleUpdate()
     if (!gnssRawFile && !gnssXferActive && online.fs)
         gnssOpenRawFile();
 
+    // Dial the tablet and take any corrections waiting on the socket. Cheap when the link
+    // is down: both return immediately unless tcpClientHost is set.
+    sensorTcpEnsure();
+    sensorTcpPoll();
+
     // ── IMU frames ──────────────────────────────────────────────────────────
     static unsigned long lastSend = 0;
     if (millis() - lastSend >= 100)
@@ -396,6 +526,9 @@ void memsBleUpdate()
         {
             memsChar->setValue(buf, (uint16_t)(count * 32));
             memsChar->notify();
+            // Same bytes, same batching, over Wi-Fi. Both paths run while BLE is being
+            // retired so a bench run can compare them on one capture rather than two.
+            sensorTcpSend(SENSOR_MSG_IMU, buf, (uint16_t)(count * 32));
         }
     }
 
@@ -492,6 +625,7 @@ void memsBleUpdate()
     memcpy(&status[48], &sVelMps,    4); // float32 LE, horizontal speed accuracy (m/s)
     statusChar->setValue(status, 52);
     statusChar->notify();
+    sensorTcpSend(SENSOR_MSG_STATUS, status, 52);
 }
 
 #else
