@@ -449,7 +449,7 @@ void memsBleUpdate()
         }
     }
 
-    // Roll/pitch from the raw-accel/gyro complementary filter (tiltProcessMEMS()) —
+    // Roll/pitch from the raw-accel/gyro complementary filter (tiltOnMemsFrame()) —
     // not the IM19 NAVI Kalman output, which needs a hand-shake init a vehicle
     // mount can't perform. Heading still comes from NAVI (0.0 when uninitialized,
     // which is expected here); the app falls back to GNSS course_deg for heading.
@@ -557,8 +557,7 @@ void tiltUpdate()
 
     case TILT_STARTED:
         // Always drain UART and process MEMS — 100 Hz stream runs regardless of fix state.
-        tiltSensor->update();
-        tiltProcessMEMS();
+        tiltSensor->update();   // frames reach the ring via tiltOnMemsFrame(), not by polling
         if (!memsBleInited) memsBleInit();
         memsBleUpdate();
 
@@ -601,8 +600,7 @@ void tiltUpdate()
 
     case TILT_INITIALIZED:
         // Waiting for user to rock unit back and forth
-        tiltSensor->update(); // Check for the most recent incoming binary data
-        tiltProcessMEMS();
+        tiltSensor->update(); // drains UART; every MEMS frame lands via tiltOnMemsFrame()
         memsBleUpdate();
 
         // Check IMU state at 1Hz
@@ -630,8 +628,7 @@ void tiltUpdate()
 
     case TILT_CORRECTING:
         // Check to see if we've stopped correcting
-        tiltSensor->update(); // Check for the most recent incoming binary data
-        tiltProcessMEMS();
+        tiltSensor->update(); // drains UART; every MEMS frame lands via tiltOnMemsFrame()
         memsBleUpdate();
 
         // Check IMU state at 1Hz
@@ -822,25 +819,30 @@ static void tiltComplementaryFilterUpdate(float ax, float ay, float az, float gx
     }
 }
 
-// Called every main loop iteration — captures each new MEMS frame into the ring buffer
-// and logs at 1 Hz so we can confirm data is flowing.
-void tiltProcessMEMS()
+// Called by the IM19 parser for EVERY MEMS frame, not once per main loop.
+//
+// It used to be called from the loop and read whatever was latest in packetMems. That caps
+// capture at the LOOP rate: update() parses every frame that arrived, but each overwrites
+// the single packetMems struct, so one poll yields one frame however many turned up. The
+// RTK Everywhere loop runs near 70 Hz, and 019ffbe7 duly recorded 2814 of the IM19's 4043
+// frames — 69.9 Hz of a true 100 Hz, with 985 single-frame gaps to 56 doubles, which is a
+// poll one frame late rather than anything dropping on the radio. The BLE link was at 55%
+// of capacity throughout, so it was never the transport.
+//
+// Runs in parser context: push to the ring and return. No serial, no BLE, no logging.
+void tiltOnMemsFrame(const IM19_MEMS_data_t *f)
 {
-    if (tiltSensor == nullptr || tiltSensor->packetMems == nullptr)
-        return;
-    if (tiltSensor->getMemsAge() > 20) // no frame in last 20 ms
-        return;
+    double t = f->timestamp;
 
     // Detect new frames by timestamp change
     static double lastSeen = -1.0;
-    double t = tiltSensor->getMemsTimestamp();
     if (t == lastSeen)
         return;
     double dt = (lastSeen >= 0.0) ? (t - lastSeen) : 0.0;
     lastSeen = t;
 
-    float ax = tiltSensor->getMemsAccelX(), ay = tiltSensor->getMemsAccelY(), az = tiltSensor->getMemsAccelZ();
-    float gx = tiltSensor->getMemsGyroX(),  gy = tiltSensor->getMemsGyroY(),  gz = tiltSensor->getMemsGyroZ();
+    float ax = f->accelX, ay = f->accelY, az = f->accelZ;
+    float gx = f->gyroX,  gy = f->gyroY,  gz = f->gyroZ;
 
     // Clamp dt so a startup sample or a stall doesn't inject a huge gyro step.
     if (dt > 0.0 && dt < 0.05)
@@ -874,6 +876,8 @@ void beginTilt()
     // Use UART2 on the ESP32 to receive IMU corrections
     // Shown as UART2 on these schematics: Torch, Facet FP
     tiltSensor = new IM19();
+    // EVERY frame, not one per loop. See tiltOnMemsFrame() for why polling costs ~30%.
+    tiltSensor->setMemsCallback(tiltOnMemsFrame);
     if (SerialForTilt == nullptr)
         SerialForTilt = new HardwareSerial(2);
 

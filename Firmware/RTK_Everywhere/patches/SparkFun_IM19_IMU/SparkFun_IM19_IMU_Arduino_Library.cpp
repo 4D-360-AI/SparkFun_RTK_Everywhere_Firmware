@@ -835,6 +835,12 @@ void IM19::eomHandler(IM19_PARSE_STATE *parse)
         memcpy(&packetMems->data.gyroX,     &parse->buffer[offsetMemsGyroX],     sizeof(float));
         memcpy(&packetMems->data.gyroY,     &parse->buffer[offsetMemsGyroY],     sizeof(float));
         memcpy(&packetMems->data.gyroZ,     &parse->buffer[offsetMemsGyroZ],     sizeof(float));
+
+        // Hand the frame over NOW. packetMems is a single struct: the next frame in this
+        // same update() call overwrites it, so anything that waits until the caller polls
+        // sees only the last frame of the batch.
+        if (memsCallback != nullptr)
+            memsCallback(&packetMems->data);
     }
     else
     {
@@ -939,6 +945,8 @@ bool IM19::initMems()
 }
 
 uint32_t IM19::getMemsAge() { return (millis() - lastUpdateMems); }
+
+void IM19::setMemsCallback(IM19_MEMS_CALLBACK cb) { memsCallback = cb; }
 
 double IM19::getMemsTimestamp()
 {

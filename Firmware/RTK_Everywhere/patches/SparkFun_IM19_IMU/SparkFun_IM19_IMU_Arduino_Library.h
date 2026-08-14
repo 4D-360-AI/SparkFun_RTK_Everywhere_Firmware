@@ -217,6 +217,16 @@ typedef struct
     IM19_MEMS_data_t data;
 } IM19_MEMS_t;
 
+// Fired once per MEMS frame AS IT IS PARSED, before the next frame overwrites packetMems.
+//
+// Sampling packetMems from the main loop instead loses every frame but the last one in each
+// loop iteration: update() drains the whole UART in one call and each parsed frame overwrites
+// the single packetMems struct, so a caller polling at 70 Hz sees 70 of the IM19's 100 frames
+// per second no matter how many actually arrived. Measured on capture 019ffbe7: 2814 frames
+// delivered against 4043 produced, ~30% lost, with single-frame gaps outnumbering doubles
+// 985:56 — the signature of a poll that is usually one frame late and occasionally two.
+typedef void (*IM19_MEMS_CALLBACK)(const IM19_MEMS_data_t *frame);
+
 class IM19
 {
   private:
@@ -273,7 +283,14 @@ class IM19
     bool initMems();
     IM19_MEMS_t *packetMems = nullptr;
 
+    // Set by setMemsCallback(). Called from the parser, so it must be short and must not
+    // block on serial or BLE — push to a ring and return.
+    IM19_MEMS_CALLBACK memsCallback = nullptr;
+
     uint32_t getMemsAge();
+
+    // Receive EVERY MEMS frame rather than whatever happened to be latest at poll time.
+    void setMemsCallback(IM19_MEMS_CALLBACK cb);
     double getMemsTimestamp();
     float getMemsAccelX();
     float getMemsAccelY();
