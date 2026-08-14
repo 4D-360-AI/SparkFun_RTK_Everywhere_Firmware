@@ -830,9 +830,9 @@ static void tiltComplementaryFilterUpdate(float ax, float ay, float az, float gx
 // of capacity throughout, so it was never the transport.
 //
 // Runs in parser context: push to the ring and return. No serial, no BLE, no logging.
-void tiltOnMemsFrame(const IM19_MEMS_data_t *f)
+void tiltOnMemsFrame(const IM19_MEMS_data_t *src)
 {
-    double t = f->timestamp;
+    double t = src->timestamp;
 
     // Detect new frames by timestamp change
     static double lastSeen = -1.0;
@@ -841,8 +841,10 @@ void tiltOnMemsFrame(const IM19_MEMS_data_t *f)
     double dt = (lastSeen >= 0.0) ? (t - lastSeen) : 0.0;
     lastSeen = t;
 
-    float ax = f->accelX, ay = f->accelY, az = f->accelZ;
-    float gx = f->gyroX,  gy = f->gyroY,  gz = f->gyroZ;
+    // Named `src`, not `f`: the ring push below builds a local MemsFrame f, and the
+    // shadowing is a hard error under the project's -Werror settings.
+    float ax = src->accelX, ay = src->accelY, az = src->accelZ;
+    float gx = src->gyroX,  gy = src->gyroY,  gz = src->gyroZ;
 
     // Clamp dt so a startup sample or a stall doesn't inject a huge gyro step.
     if (dt > 0.0 && dt < 0.05)
